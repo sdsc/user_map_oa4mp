@@ -1,0 +1,316 @@
+#!/bin/env bash
+
+# Unprivileged helper script for user_map_oa4mp
+#
+# The user_map_oa4mp runs as root, but runs this
+# as an unprivleged user in case things go awry, 
+# especially with TLS and x509 parsing.
+#
+# Call this script with the OIDC_access_token provided by
+# mod_auth_openidc 
+#
+# it will:
+#   obtain an x509 certificate from the oa4mp server
+#   map the x509 certifcate to a username
+#   save the certificate and private key in a temporary location
+#   return the filename with the certificate, username is in the filename
+#
+# See configuration options below.
+# Set them for your local deployment, or set your local deployment to match them. 
+
+
+###############################
+### DO NOT RUN THIS AS ROOT ###
+###############################
+### You will have a bad day ###
+### if programs like curl   ###
+### have an exploitable RCE ###
+###############################
+
+
+## set these to your local deployment
+
+# GRID_SECURITY_DIR directory
+# contains
+#   ./certificates/   - trust anchors and crls
+#   ./grid-mapfile    - gsi grid-mapfile for DN->local user mapping
+#   ./grid-mapfile.portal-overrides   - OPTIONAL, contains first-chance mappings for weird
+#                                       situations like multiple usernames for a single DN
+GRID_SECURITY_DIR=/etc/grid-security
+
+# Files with parameters for oa4mp start with this string.
+# e.g. <OA4MP_CLIENT_SECRETS_BASE>.<extension>
+# We store tokens in a file, so they're not accidentally
+# checked in, nor unnecessarily copied, nor exposed on the command line.
+# the extensions are:
+# .secret = contains one line, the oa4mp client secret and oa4mp id
+#           in POST format. e.g. "client_secret=<client_secret>&client_id=<client_id>"
+# .url    = contains one line, the oa4mp url
+# Note that these files need to be owned by the account that this script runs as.
+# They will be checked below for readability and mode 400.
+OA4MP_CLIENT_SECRETS_BASE=/var/secrets/oauth_client
+
+
+### END OF CONFIG ###
+
+
+# Call this to remove the temporary files and exit.
+function cleanup
+{
+  if [[ ! -z "${WORKDIR}" && "${WORKDIR}" != '' ]]; then
+    rm -f "${WORKDIR}/privkey.pem" \
+          "${WORKDIR}/cert.pem" \
+          "${WORKDIR}/csr.pem"  \
+          "${WORKDIR}/access_token" \
+          "${WORKDIR}/req.pem" \
+          "${WORKDIR}/req.data"
+    rmdir "${WORKDIR}"
+  fi
+  exit "${1}"
+}
+
+
+# We want to make sure the oa4mp secrets are 
+# present and reasonably secured.
+function check_oa4mp_secret
+{
+  OA4MP_SECRET_FILE="${OA4MP_CLIENT_SECRETS_BASE}.${1}"
+
+  # check for missing/bad oa4mp client secrets
+  if [[ ! -f "${OA4MP_SECRET_FILE}" ]]; then
+    echo "Missing: ${OA4MP_SECRET_FILE}" 1>&2
+    exit 1
+  fi
+
+  # check if oa4mp client secrets file is too open
+  if [[ $( stat -c '%a' "${OA4MP_SECRET_FILE}" ) != '400' ]]; then
+    echo "Wrong perms, expecting '400' on: ${OA4MP_SECRET_FILE}" 1>&2
+    exit 1
+  fi
+
+  # check if can't read oa4mp client secrets file
+  if [[ ! -r "${OA4MP_SECRET_FILE}" ]]; then
+    echo "Unable to read: ${OA4MP_SECRET_FILE}" 1>&2
+    exit 1
+  fi
+}
+
+
+# We'll try mapping with multiple files since
+# The regular grid-mapfile can map a DN to multiple
+# local usernames. This is problematic since we don't
+# actually have a way to prompt the user for the
+# username they want to use.
+# 
+# For the time being, we'll need to override the
+# grid-mapfile for some entries, and only specify
+# a single mapping.
+#
+# To reduce duplicate code, we do the search with
+# this funciton.  It will take a DN and return
+# a single username or the empty string.
+function mapdn
+{
+  # regex to split mapfile line into dn and username
+  SPLIT_REGEX='^"([^"]+)"\s+(.+)$'
+
+  GRID_MAPFILE="${1}"
+  DN="${2}"
+  MAPPED_USER=''
+
+  # No mapping file = no match.
+  if [[ ! -f "${GRID_MAPFILE}" || ! -r "${GRID_MAPFILE}" ]]; then
+    echo ''
+    return 1 
+  fi
+
+  # Passing anchored regexes into grep can be difficut
+  # since we also want to avoid getting metacharacters
+  # into the pattern match from the DN string. (And
+  # anchored regexes are a good thing here!)
+  # Rather than get into escaping, take a multi-step 
+  # approach to whittle down the candidates.
+  # Bonus: user-supplied content doesn't go into a regex.
+
+  # Step 1: use fixed-string grep to get possible hits.
+  # Fgrep knows nothing about the structure of a mapfile entry, so
+  # it may return multiple matches, some of which aren't correct mappings.
+  # e.g. given DN "/cn=abe", fgrep can match "/cn=abe" as well as "/cn=abel"
+  IFSOLD=${IFS}
+  IFS=$'\n'
+  for I in $( cat "${GRID_MAPFILE}" | fgrep "${DN}" ); do
+    # Step 2: split dn and local user, string match the dn.
+    if [[ $I =~ ${SPLIT_REGEX} && "${BASH_REMATCH[1]}" == "${DN}" ]]; then
+      if [[ "${MAPPED_USER}" == '' ]]; then
+        MAPPED_USER="${BASH_REMATCH[2]}"
+      else
+        # Multiple username matches is an automatic oops.
+        echo ''
+        IFS=${IFSOLD}
+        return 2
+      fi
+    fi   
+  done
+  IFS=${IFSOLD}
+  echo "${MAPPED_USER}"
+}
+ 
+
+
+
+# housekeeping
+umask 0077
+set -u
+cd /tmp
+
+# to be set later
+WORKDIR=''
+
+
+# check our uid and gid
+# DON'T RUN AS ROOT. WE DON'T NEED IT.
+if [[ $( id -u ) -eq 0 || $( id -g ) -eq 0 ]]; then
+  echo "Refusing to run with root privileges" 1>&2
+  exit 3
+fi
+
+  
+# check for missing programs
+for I in openssl curl mktemp sed fgrep tr; do
+  if [[ ! $( which "${I}" 2>/dev/null ) ]]; then
+    echo "${I}" is not in path 1>&2
+    exit 1
+  fi
+done
+
+
+# make sure oa4mp client secrets are present
+for I in url secret; do
+  check_oa4mp_secret "${I}"
+done
+
+
+# Get access token from args.
+if [[ -z "${1+a}" || "${1}" == '' ]]; then
+  echo "Usage: ${0} <OIDC_access_token>" 1>&2
+  exit 1
+fi
+ACCESS_TOKEN="${1}"
+shift
+
+
+# We'll need to make some intermediate files, store them here.
+WORKDIR=$( mktemp -d /tmp/usermap_oa4mp.XXXXXXXX )
+if [[ "${WORKDIR}" == '' ]]; then
+  echo "Unable to create workdir in /tmp" 1>&2
+  cleanup 1
+fi
+
+
+# Generate a cert request and keypair in one shot.
+# Note: oa4mp will fill in the correct subject.
+openssl req \
+  -newkey rsa:2048 \
+  -nodes \
+  -subj '/C=US/CN=Placeholder' \
+  -sha256 \
+  -keyout "${WORKDIR}/privkey.pem" \
+  -out    "${WORKDIR}/req.pem"  &>/dev/null
+
+
+# Curl doesn't support naming a variable in post data and
+# reading its value from a file (except when urlencoding).
+# We'll have to save the variable names and the value in
+# a file, since we want to keep data off the command line.
+
+# Save access token.
+printf "access_token=%s" "${ACCESS_TOKEN}" > "${WORKDIR}/access_token"
+
+# Save certificate request.
+# Note: oa4mp wants just the base64 blob, no decoration, no newlines.
+# This is one of those times when we want urlencoding, so
+# no need to put the variable name in the file...
+# we still need to massage the original csr though.
+cat "${WORKDIR}/req.pem" | grep -v '^---' | tr -d '\n' >> "${WORKDIR}/req.data"
+
+
+# Fire off the request.
+curl \
+  --silent \
+  --show-error \
+  --data "@${WORKDIR}/access_token" \
+  --data "@${OA4MP_CLIENT_SECRETS_BASE}.secret" \
+  --data-urlencode "certreq@${WORKDIR}/req.data" \
+  -X POST \
+  $( cat "${OA4MP_CLIENT_SECRETS_BASE}.url" ) \
+  > "${WORKDIR}/cert.pem"
+
+
+# verify the certificate
+VERIFY_RESULT=$( cat "${WORKDIR}/cert.pem" | \
+  openssl verify \
+    -CApath "${GRID_SECURITY_DIR}/certificates" \
+    -crl_check_all \
+    -x509_strict  \
+    2>/dev/null  )
+if [[ ! "${VERIFY_RESULT}" =~ ^stdin:\ OK$ ]]; then
+  echo "Certificate from oa4mp server is not valid" 1>&2
+  cleanup 1
+fi
+
+
+# we'll need the dn (subject)
+DN=$( openssl x509 -noout -subject -in "${WORKDIR}/cert.pem" | sed -e 's/^subject= //')
+if [[ ${DN} == '' ]]; then
+  echo "Unable to extract DN/Subject from cert" 1>&2
+  cleanup 1
+fi
+
+
+# map to local user
+# The grid-mapfile can map multiple usernames to
+# a dn, which is bad for us. Try the override file
+# first, then the grid-mapfile.
+MAPPED_USER=$( mapdn "${GRID_SECURITY_DIR}/grid-mapfile.portal-overrides" "${DN}" )
+if [[ "${MAPPED_USER}" == '' ]]; then
+  # try the main mapfile
+  MAPPED_USER=$( mapdn "${GRID_SECURITY_DIR}/grid-mapfile" "${DN}" )
+fi
+if [[ "${MAPPED_USER}" == '' ]]; then
+  # give up.
+  printf "Unable to map DN to a local user: %s\n" "${DN}" 1>&2
+  cleanup 1
+fi
+
+
+# Safely save the cert + privkey
+# Since this is running as not root, we'll save
+# the file and pass it back to the (hopefully root-full)
+# caller.
+# The caller should use something race-free like 
+# ln to put the file in its final resting place, instead of
+# simple cp or even mv -n, which aren't necessarily race-free.
+TMPCERTFILE=$( mktemp "/tmp/oa4mp_${MAPPED_USER}.XXXXXX" )
+if [[ "${TMPCERTFILE}" == '' ]]; then
+  echo "Unable to create temporary cert file in /tmp" 1>&2
+  cleanup 1
+fi
+
+# Umask should have taken care of this already
+# but let's be paranoid.
+chmod 600 "${TMPCERTFILE}"
+
+# Dump in the private key and cert since
+# gsissh knows how to handle this.
+cat "${WORKDIR}/privkey.pem" > "${TMPCERTFILE}"
+printf "\n" >> "${TMPCERTFILE}"
+cat "${WORKDIR}/cert.pem" >> "${TMPCERTFILE}"
+
+
+# Let the caller know where we stashed the file and
+# clean up.
+echo "${TMPCERTFILE}"
+cleanup 0
+
+
+

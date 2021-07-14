@@ -1,0 +1,48 @@
+#!/bin/bash -u
+
+# This script sets up the user's home directory for SDSC Expanse
+# It is run as the user, and may be called from user_map_oa4mp
+
+USERNAME=$1
+USER_ID=`id -u $USERNAME`
+OOD_USER_HOME=`eval echo "~$USERNAME"`
+
+# Mount my home directory from expanse
+EXPANSE_HOSTNAME="login.expanse.sdsc.edu"
+REMOTE_HOME_DIR="/home/${USERNAME}"
+EXPANSE_MOUNT_DIR="${OOD_USER_HOME}/expanse"
+OOD_DATAROOT="${EXPANSE_MOUNT_DIR}/.ood_portal"
+OOD_DATAROOT_SYMLINK="${OOD_USER_HOME}/.ood_portal"
+
+# Directory needs to exist
+if [ ! -d "${EXPANSE_MOUNT_DIR}" ]
+then
+  mkdir -p "${EXPANSE_MOUNT_DIR}"
+fi
+
+# Mounted already?
+if [ $( stat -fc %T "${EXPANSE_MOUNT_DIR}" ) != "fuseblk" ]
+then
+  sshfs -o nonempty -o idmap=user "${EXPANSE_HOSTNAME}:${REMOTE_HOME_DIR}" "${EXPANSE_MOUNT_DIR}"
+fi
+
+# Mount scratch
+if [ ! -d "${OOD_USER_HOME}/scratch" ]
+then
+  mkdir -p "${OOD_USER_HOME}/scratch"
+fi
+
+if [ $( stat -fc %T "${OOD_USER_HOME}/scratch" ) != "fuseblk" ]
+then
+  sshfs -o nonempty -o idmap=user "${EXPANSE_HOSTNAME}:/expanse/lustre/scratch/${USERNAME}" "${OOD_USER_HOME}/scratch"
+fi
+
+# Set up a directory to store ood metadata on expanse
+if [ ! -d "${OOD_DATAROOT}" ]
+then
+  mkdir -p ${OOD_DATAROOT}
+fi
+
+# Remove any existing symlink and add new symlink to ood metadata directory
+[ ! -L "${OOD_DATAROOT_SYMLINK}" ] || rm -f "${OOD_DATAROOT_SYMLINK}"; # Remove existing
+ln -s "${OOD_DATAROOT}" "${OOD_DATAROOT_SYMLINK}" # Add new

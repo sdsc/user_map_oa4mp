@@ -1,0 +1,389 @@
+#!/bin/env bash
+
+# User_map script with oa4mp support
+#
+# Call this as root with the OIDC_access_token provided by
+# mod_auth_openidc (or whatever else produces an an access token)
+#
+#
+# This script will:
+#   call user_map_oa4mp_unprivileged_helper in the same directory
+#     which will:
+#       obtain an x509 certificate from the oa4mp server
+#       map the x509 certifcate to a username
+#       save the certificate and private key in a temporary location
+#       return the filename with the certificate, username is in the filename
+#   extract the username
+#   safely put the certificate in the well-known location for gsissh to use
+#   set proper ownership and modes
+#   create home directory if it doesn't exist
+#   return the username
+#
+#
+# Edit the configuration below to match your local deployment, 
+# or edit your local deployment to match the configuration below.
+
+
+# Helper user - unprivileged user to run the helper script as.
+# This helps avoid unconstrained root RCE if there's a problem
+# with any of the steps taken by the helper script.
+# 
+# Set this to an account that doesn't have login privileges, as
+# it will need to have access to the oa4mp secrets, which in turn
+# allow it to request certificates.
+HELPER_USER=saslauth
+HELPER_GROUP=saslauth
+
+# Call this script with the local username to complete any 
+# additional tasks, such as setting up sshfs mounts.
+# This should be run as the target user.
+# We specify the username as an argument as an extra guard against
+# mistakes (like running as root by the curious).
+SETUP_USER_SCRIPT=/etc/ood/custom_scripts/setup_user_expanse
+
+### END OF CONFIG ###
+
+# We'll need to figure out where we're running from, so the
+# helper script can be run.
+pushd $( dirname "${0}" ) &>/dev/null
+SCRIPTDIR=$( pwd )
+popd &>/dev/null
+
+# housekeeping
+umask 0077
+set -u
+cd /tmp
+
+
+# STDERR goes nowhere useful.  Send messages to syslog too!
+function logit
+{
+    echo "${1}" 1>&2
+    logger -i -t user_map_oa4mp "${1}"
+}
+
+
+# The helper script better be here!
+HELPER_SCRIPT="${SCRIPTDIR}/user_map_oa4mp_unprivileged_helper"
+if [[ ! -f "${HELPER_SCRIPT}" || ! -x "${HELPER_SCRIPT}" ]]; then
+  logit "Missing or unable to execute helper script: ${HELPER_SCRIPT}" 
+  echo ''
+  exit 1
+fi
+
+# check if local username meets criteria
+# pass local username in on first arg
+# prints username if good, empty string otherwise
+# exits the entire program if there's a problem.
+function check_user
+{
+  if [[ -z "${1+a}" || "${1}" == '' ]]; then 
+    echo ''
+    exit 1
+  fi
+  LOCAL_USER="${1}"
+
+  if [[ "${LOCAL_USER}" == '' ]]; then
+    logit "Failed to map user. POSSIBLE ATTACK: Wrong filename format." 
+    echo ''
+    exit 1
+  fi
+
+  if [[ "${LOCAL_USER}" =~ [^.-_a-zA-Z0-9] ]]; then
+    logit "Failed to map user. POSSIBLE ATTACK: Local user has illegal characters." 
+    echo ''
+    return 1
+  fi
+
+  # Get the local uid.
+  LOCAL_UID=$( id -ru "${LOCAL_USER}" )
+  if [[ "${LOCAL_UID}" == '' ]]; then
+    logit "Failed to map user. Local user does not exist."
+    echo ''
+    exit 1
+  fi
+
+  # Check local uid for... stuff.
+  if [[ "${LOCAL_UID}" == "0" ]]; then
+    logit "Failed to map user. POSSIBLE ATTACK: mapped to root."
+    echo ''
+    exit 1
+  fi
+
+  if [[ "${LOCAL_UID}" -lt 100 ]]; then
+    logit "Failed to map user. POSSIBLE ATTACK: mapped to uid < 100"
+    echo ''
+    exit 1
+  fi
+
+
+  # Check local uid for even more stuff.
+  # This should never happen, but it might, thats why we check.
+  if [[ "${LOCAL_UID}" =~ [^0-9] ]]; then
+    logit "Failed to map user. POSSIBLE ATTACK: Local UID is not an integer."
+    echo ''
+    exit 1
+  fi
+
+  LOCAL_GID=$( id -rg "${LOCAL_USER}" )
+  if [[ "${LOCAL_GID}" == '' || "${LOCAL_GID}" =~ [^0-9] ]]; then
+    logit "Failed to map user. POSSIBLE ATTACK: Local GID is not an integer."
+    echo ''
+    exit 1
+  fi
+
+  # Guess we're good to go.
+  logit "Mapped ${LOCAL_USER} from token ${ACCESS_TOKEN} via cache"
+  printf "%s" "${LOCAL_USER}"
+  return 0
+}
+
+
+
+# Since the script can be called multiple times per session, and we can only
+# use the access token once, we'll need to cache the mapping.
+# Check that cache here.
+#
+# We could use a database, but the /tmp filesystem should work just fine.
+#
+# check_cache - supply access token, prints cached local username or
+# empty string if failure
+# might exit the entire program if really bad data is encountered
+function read_cache
+{
+  if [[ "${1+x}" == '' || "${1}" == '' ]]; then
+    echo ''
+    return 1
+  fi
+
+  ACCESS_TOKEN_HASH=$( printf "%s" "${1}" | sha256sum | awk '{print $1}' )
+  CACHE_ENTRY="/tmp/usermap_oa4mp-${ACCESS_TOKEN_HASH}"
+
+  # no entry
+  if [[ ! -f "${CACHE_ENTRY}" ]]; then
+    echo ''
+    return 0
+  fi
+
+  # must be owned by root, otherwise anyone can write a mapping.
+  CACHE_OWNER=$( stat -c %u "${CACHE_ENTRY}" )
+  if [[ "${CACHE_OWNER}" != "0" ]]; then 
+    logit "${CACHE_ENTRY} not owned by root! Ignoring it"
+    echo ''
+    return 0
+  fi
+
+  # better not be world/group writable
+  CACHE_PERMS=$( stat -c %a "${CACHE_ENTRY}" )
+  if [[ "${CACHE_PERMS}" != "644" ]]; then
+    logit "${CACHE_ENTRY} has bad perms, expecting 644. Ignoring it" 
+    echo ''
+    return 0
+  fi
+
+  # Take a peek.
+  MAPPED_USER=$(cat "${CACHE_ENTRY}")
+  if [[ "${MAPPED_USER}" == '' ]]; then
+    echo ''
+    return 0
+  fi
+
+  # Just make sure it's legit-looking
+  CHECKED_MAPPED_USER=$( check_user "${MAPPED_USER}" )
+
+  # Some checks for certificate
+  LOCAL_UID=$( id -ru "${CHECKED_MAPPED_USER}" )
+  # no cert, we'll need to get one.
+  if [[ ! -f "/tmp/x509up_u${LOCAL_UID}" ]]; then
+    logit 'Cache entry found, but certificate is missing. Will need to get one.'
+    echo ''
+    return 0
+  fi
+
+  # bad ownership, we'll need to get one.
+  if [[ $( stat -c %u "/tmp/x509up_u${LOCAL_UID}" ) != "${LOCAL_UID}" ]]; then
+    logit 'Cache entry found, certificate has wrong ownership. Will need to get one.' 
+    echo ''
+    return 0
+  fi
+
+  # expires soon, we'll need to get one.
+  # this check can't be performed when running as apache.
+  #  ... this check shouldn't fail as long as the max session lifetime is
+  #      less than the certificate lifetime.
+  #openssl x509 -noout -checkend 86400 -in "/tmp/x509up_u${LOCAL_UID}"
+  #if [[ $? -ne 0 ]]; then
+  #  logit 'Cache entry found, certificate will expire soon. Will need to get one.' 
+  #  echo ''
+  #  return 0
+  #fi
+
+  printf "%s" "${CHECKED_MAPPED_USER}" 
+  return 0
+}
+
+# write_cache - supply access token, local username, writes cache entry
+function write_cache
+{
+  if [[ "${1+x}" == '' || "${1}" == '' ]]; then
+    return 1
+  fi
+
+  if [[ "${2+x}" == '' || "${2}" == '' ]]; then
+    return 1
+  fi
+
+  ACCESS_TOKEN_HASH=$( printf "%s" "${1}" | sha256sum | awk '{print $1}' )
+  CACHE_ENTRY="/tmp/usermap_oa4mp-${ACCESS_TOKEN_HASH}"
+
+  # no entry, make an empty one
+  if [[ ! -f "${CACHE_ENTRY}" ]]; then
+    PREV_UMASK=$( umask )
+    umask 0022
+    touch "${CACHE_ENTRY}"
+    umask ${PREV_UMASK}
+  fi
+
+  # must be owned by root, otherwise anyone can write a mapping.
+  CACHE_OWNER=$( stat -c %u "${CACHE_ENTRY}" )
+  if [[ "${CACHE_OWNER}" != "0" ]]; then 
+    logit "${CACHE_ENTRY} not owned by root! Clobbering it" 
+    rm -f "${CACHE_ENTRY}"
+    PREV_UMASK=$( umask )
+    umask 0022
+    touch "${CACHE_ENTRY}"
+    umask ${PREV_UMASK}
+    CACHE_OWNER=$( stat -c %u "${CACHE_ENTRY}" )
+    if [[ "${CACHE_OWNER}" != "0" ]]; then 
+      logit "${CACHE_ENTRY} STILL not owned by root! Giving up" 
+      return 1
+    fi
+  fi
+
+  # better have restrictive permissions
+  # The umask failed, so dunno what's going on at this point;
+  # there's a possibility that the file was world-writable and
+  # an FH is still open.
+  # Don't mess with it, as this is probably a security incident.
+  CACHE_PERMS=$( stat -c %a "${CACHE_ENTRY}" )
+  if [[ "${CACHE_PERMS}" != "644" ]]; then
+    logit "${CACHE_ENTRY} has bad perms, expecting 644. Giving up"
+    return 1
+  fi
+
+  # At this point, the cache entry exists and has reasonable permissions.
+  # Okay to dump in the entry.
+  printf "%s" "${2}" > "${CACHE_ENTRY}"
+  return 0
+}
+
+
+
+
+
+# Get the access token.
+if [[ -z "${1+a}" || "${1}" == '' ]]; then
+  echo "Usage: $0 <OIDC access token>" 1>&2
+  echo ''
+  exit 1
+fi
+ACCESS_TOKEN="${1}"
+
+# We might have a cached entry, do we?
+CACHED_USER=$( read_cache  "${ACCESS_TOKEN}" )
+if [[ "${CACHED_USER}" != '' ]]; then
+  echo "${CACHED_USER}"
+  exit 0
+fi
+
+# We're usually running as the apache user, but if there's a cache miss
+# the rest of this requires some user-switching, so become root and
+# try again.
+if [[ $( id -ru ) != "0" ]]; then
+  exec sudo $0 "${@}"
+fi
+
+
+# Call the helper to do all the heavy lifting.
+TEMPCERTFILE=$( su \
+  -s /bin/sh \
+  -g "${HELPER_GROUP}" \
+  -c "${HELPER_SCRIPT} ${ACCESS_TOKEN}" \
+  -- \
+  "${HELPER_USER}" )
+
+CERTFILE_REGEX='^/tmp/oa4mp_([-.a-zA-Z0-9_]+)\..+$'
+if [[ ! "${TEMPCERTFILE}" =~ ${CERTFILE_REGEX} ]]; then
+  logit "Failed to map user. TEMPCERTFILE name is in wrong format. ${TEMPCERTFILE}" 
+  echo ''
+  exit 1
+fi
+
+# Double check the file that was returned...
+if [[ ! -f "${TEMPCERTFILE}" ]]; then
+  logit  "Failed to map user. OA4MP cert file is missing." 
+  echo ''
+  exit 1
+fi
+
+# It needs to be owned by the helper user, just in case
+# someone managed to race mktemp.
+if [[ $( stat -c '%U' "${TEMPCERTFILE}" ) != "${HELPER_USER}" ]]; then
+  logit "Failed to map user. POSSIBLE ATTACK: OA4MP cert file is not owned by the helper user." 
+  echo ''
+  exit 1
+fi
+
+# Be extra sure!
+# check_user blows up if there's a problem.
+LOCAL_USER=$( check_user "${BASH_REMATCH[1]}" )
+LOCAL_UID=$( id -ru "${LOCAL_USER}" )
+if [[ "${LOCAL_UID}" == '' ]]; then
+  logit "Failed to map user. Local user does not exist." 
+  echo ''
+  exit 1
+fi
+LOCAL_GID=$( id -rg "${LOCAL_USER}" )
+if [[ "${LOCAL_GID}" == '' || "${LOCAL_GID}" =~ [^0-9] ]]; then
+  logit "Failed to map user. POSSIBLE ATTACK: Local GID is not an integer."
+  echo ''
+  exit 1
+fi
+
+
+# Safely move the cert into place
+CERTFILE="/tmp/x509up_u${LOCAL_UID}"
+# Oh well, nobody should be squatting this filename anyway.
+# It may be a legit certificate, but let's lay down the
+# new one since we already have it.
+rm -f "${CERTFILE}"
+ln "${TEMPCERTFILE}" "${CERTFILE}" && rm -f "${TEMPCERTFILE}"
+if [[ $? -ne 0 ]]; then
+  logit "Failed to relocate user cert."
+  echo ''
+  exit 1
+fi
+chmod 400 "${CERTFILE}"
+chown -h "${LOCAL_UID}:${LOCAL_GID}" "${CERTFILE}"
+
+# Might as well check the user's home directory.
+# Create it if it's missing.
+if [[ ! -d "/home/${LOCAL_USER}" ]]; then
+  mkdir "/home/${LOCAL_USER}"
+  chown -h "${LOCAL_UID}:root" "/home/${LOCAL_USER}"
+  chmod 0700 "/home/${LOCAL_USER}"
+fi
+
+logit "Mapped ${LOCAL_USER} from token ${ACCESS_TOKEN}"
+
+write_cache "${ACCESS_TOKEN}" "${LOCAL_USER}"
+echo "${LOCAL_USER}"
+
+if [[ -x "${SETUP_USER_SCRIPT}" ]]; then
+  echo "Running as $(whoami)" | logit
+  su - "${LOCAL_USER}" -c "${SETUP_USER_SCRIPT} ${LOCAL_USER}" 1>/dev/null
+fi
+exit $?
+
+
+
